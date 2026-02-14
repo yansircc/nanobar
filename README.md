@@ -23,15 +23,17 @@ nanobar <command>
 | Command | Description |
 |---------|-------------|
 | `list` | List all menu bar items with their positions |
-| `start` | Start the daemon (adds a `\|` divider to the menu bar) |
+| `start` | Start the daemon (adds a `›` divider to the menu bar) |
 | `hide [apps...]` | Hide items to the left of the divider |
 | `show` | Show all hidden items |
 | `stop` | Stop the daemon and remove the divider |
 | `status` | Show current daemon state and item visibility |
+| `install` | Install launch agent for auto-start at login |
+| `uninstall` | Remove launch agent |
 
 ### Examples
 
-Start the daemon — a `|` divider appears in your menu bar. Drag it to choose where to split visible/hidden items:
+Start the daemon — a `›` divider appears in your menu bar. Drag it to choose where to split visible/hidden items:
 
 ```bash
 nanobar start
@@ -73,12 +75,42 @@ Stop the daemon and remove the divider:
 nanobar stop
 ```
 
+### Auto-start
+
+To have nanobar start automatically at login:
+
+```bash
+nanobar install
+```
+
+This creates a LaunchAgent at `~/Library/LaunchAgents/nanobar.plist`. To remove it:
+
+```bash
+nanobar uninstall
+```
+
+You can also toggle this from the right-click menu (see below).
+
+### Click to Toggle
+
+The divider works as a toggle button:
+
+- `›` (visible state) — **click to hide** items to its left
+- `‹` (hidden state) — **click to show** all items
+
+### Right-click Menu
+
+Right-click the divider to open a context menu:
+
+- **Start at Login** — toggle auto-start (shows ✓ when enabled)
+- **Quit** — stop the daemon
+
 ## How It Works
 
-1. `nanobar start` spawns a background daemon that creates an `NSStatusItem` with a `|` title
+1. `nanobar start` spawns a background daemon that creates an `NSStatusItem` divider (`›`) and an invisible pusher item
 2. The divider's position is persisted via `NSStatusItem.autosaveName`, so it survives restarts
-3. `nanobar hide` tells the daemon (via Unix socket) to expand the divider to 10000pt, pushing left-side items off-screen
-4. `nanobar show` contracts it back to normal width
+3. `nanobar hide` (or clicking `›`) tells the daemon to expand the pusher to 10000pt, pushing left-side items off-screen, and changes the divider to `‹`
+4. `nanobar show` (or clicking `‹`) collapses the pusher back and restores the divider to `›`
 5. `nanobar hide <apps>` reads each app's saved `NSStatusItem Preferred Position` from `defaults` and repositions the divider accordingly
 
 The daemon communicates with the CLI over a Unix socket at `/tmp/nanobar.sock`. AppKit calls are dispatched to the main thread via `dispatch_async_f`.

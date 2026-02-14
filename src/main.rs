@@ -2,6 +2,8 @@ mod client;
 mod daemon;
 mod menubar;
 
+use std::path::PathBuf;
+
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
@@ -29,6 +31,10 @@ enum Commands {
     Stop,
     /// Show current status
     Status,
+    /// Install launch agent for auto-start at login
+    Install,
+    /// Uninstall launch agent
+    Uninstall,
     /// Internal: run as daemon process
     #[command(hide = true)]
     Daemon,
@@ -47,6 +53,8 @@ fn main() -> Result<()> {
         Commands::Show => cmd_show(),
         Commands::Stop => cmd_stop(),
         Commands::Status => cmd_status(),
+        Commands::Install => cmd_install(),
+        Commands::Uninstall => cmd_uninstall(),
         Commands::Daemon => {
             daemon::run_daemon();
             Ok(())
@@ -271,6 +279,71 @@ fn cmd_stop() -> Result<()> {
     if resp == "ok" {
         println!("daemon stopped");
     }
+    Ok(())
+}
+
+// -- LaunchAgent helpers (used by main.rs and daemon.rs) --
+
+pub fn launchagent_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join("Library/LaunchAgents/nanobar.plist")
+}
+
+pub fn is_installed() -> bool {
+    launchagent_path().exists()
+}
+
+fn cmd_install() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let exe_path = exe.to_string_lossy();
+    let plist_path = launchagent_path();
+
+    // Ensure LaunchAgents directory exists
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>nanobar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        exe_path
+    );
+
+    std::fs::write(&plist_path, plist)?;
+    println!("installed: {}", plist_path.display());
+    println!("nanobar will start automatically at login");
+    Ok(())
+}
+
+fn cmd_uninstall() -> Result<()> {
+    let plist_path = launchagent_path();
+    if !plist_path.exists() {
+        println!("not installed");
+        return Ok(());
+    }
+
+    // Try to unload first (ignore errors if not loaded)
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &plist_path.to_string_lossy()])
+        .status();
+
+    std::fs::remove_file(&plist_path)?;
+    println!("uninstalled");
     Ok(())
 }
 
