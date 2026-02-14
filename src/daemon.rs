@@ -64,7 +64,7 @@ unsafe extern "C" fn process_on_main(_ctx: *mut c_void) {
             }
             2 => {
                 // Show: collapse pusher, restore divider
-                pusher.setLength(0.0);
+                pusher.setLength(NSVariableStatusItemLength);
                 if let Some(button) = item.button(mtm) {
                     button.setTitle(ns_string!("\u{203a}"));
                 }
@@ -72,7 +72,7 @@ unsafe extern "C" fn process_on_main(_ctx: *mut c_void) {
             }
             3 => {
                 // Stop: clean up and exit
-                pusher.setLength(0.0);
+                pusher.setLength(NSVariableStatusItemLength);
                 CURRENT_STATE.store(0, Ordering::SeqCst);
                 let _ = std::fs::remove_file(socket_path());
                 let _ = std::fs::remove_file(pid_path());
@@ -230,12 +230,18 @@ define_class!(
                 button.setTitle(ns_string!("\u{203a}"));
             }
 
-            // Create the pusher status item (invisible by default, expands to hide items)
+            // Create the pusher status item (variable length by default, expands to hide items).
+            // Must use NSVariableStatusItemLength (not 0.0) and set a button title so the
+            // item participates in status bar layout — matching how Ice creates its control items.
             if let Some(divider_pos) = read_divider_position() {
                 write_pusher_position(divider_pos + 2.0);
             }
-            let pusher_item = status_bar.statusItemWithLength(0.0);
+            let pusher_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
             pusher_item.setAutosaveName(Some(ns_string!("Pusher-0")));
+            if let Some(button) = pusher_item.button(mtm) {
+                // Zero-width space — invisible but gives the item a proper content view
+                button.setTitle(ns_string!("\u{200B}"));
+            }
 
             // Create the menu
             let menu = NSMenu::new(mtm);
