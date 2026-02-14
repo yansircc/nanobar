@@ -9,10 +9,12 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{
+    ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSString,
+};
 
 // -- Global state for cross-thread communication --
 
@@ -39,7 +41,6 @@ extern "C" {
 }
 
 /// Callback executed on the main thread via dispatch_async_f.
-/// Reads the pending command and adjusts the status items accordingly.
 unsafe extern "C" fn process_on_main(_ctx: *mut c_void) {
     let cmd = PENDING_CMD.swap(0, Ordering::SeqCst);
     let item_ptr = ITEM_PTR.load(Ordering::SeqCst);
@@ -48,16 +49,13 @@ unsafe extern "C" fn process_on_main(_ctx: *mut c_void) {
         return;
     }
 
-    // SAFETY: ptrs point to valid NSStatusItems created on the main thread.
-    // This callback runs on the main thread (dispatched to main queue).
-    // The items are kept alive by DaemonDelegate ivars.
     unsafe {
         let item = &*(item_ptr as *const NSStatusItem);
         let pusher = &*(pusher_ptr as *const NSStatusItem);
         let mtm = MainThreadMarker::new().unwrap();
         match cmd {
             1 => {
-                // Hide: expand pusher to push items off screen, show indicator
+                // Hide: expand pusher to push items off screen
                 pusher.setLength(10000.0);
                 if let Some(button) = item.button(mtm) {
                     button.setTitle(ns_string!("\u{2039}"));
@@ -138,7 +136,6 @@ pub fn pid_path() -> PathBuf {
 // -- Socket listener (runs in background thread) --
 
 fn socket_listener(path: PathBuf) {
-    // Clean up stale socket
     let _ = std::fs::remove_file(&path);
 
     let listener = match UnixListener::bind(&path) {
@@ -231,20 +228,16 @@ define_class!(
 
             if let Some(button) = status_item.button(mtm) {
                 button.setTitle(ns_string!("\u{203a}"));
-                // Left-click: toggle visibility via button action
-                let _: () = unsafe { msg_send![&*button, setAction: sel!(toggleVisibility:)] };
-                let _: () = unsafe { msg_send![&*button, setTarget: &*(self as *const DaemonDelegate as *const AnyObject)] };
             }
 
             // Create the pusher status item (invisible by default, expands to hide items)
-            // Position it just to the LEFT of the divider so it pushes the correct items
             if let Some(divider_pos) = read_divider_position() {
                 write_pusher_position(divider_pos + 2.0);
             }
             let pusher_item = status_bar.statusItemWithLength(0.0);
             pusher_item.setAutosaveName(Some(ns_string!("Pusher-0")));
 
-            // Create the right-click menu
+            // Create the menu
             let menu = NSMenu::new(mtm);
 
             // Start at Login item
@@ -262,11 +255,12 @@ define_class!(
                 )
             };
             unsafe {
-                login_item.setTarget(Some(&*(self as *const DaemonDelegate as *const AnyObject)));
+                login_item.setTarget(Some(
+                    &*(self as *const DaemonDelegate as *const AnyObject),
+                ));
             }
             menu.addItem(&login_item);
 
-            // Separator
             menu.addItem(&NSMenuItem::separatorItem(mtm));
 
             // Quit item
@@ -279,15 +273,19 @@ define_class!(
                 )
             };
             unsafe {
-                quit_item.setTarget(Some(&*(self as *const DaemonDelegate as *const AnyObject)));
+                quit_item.setTarget(Some(
+                    &*(self as *const DaemonDelegate as *const AnyObject),
+                ));
             }
             menu.addItem(&quit_item);
 
-            // Right-click context menu on the button (don't use status_item.setMenu
-            // which would override the left-click action)
-            if let Some(button) = status_item.button(mtm) {
-                let _: () = unsafe { msg_send![&*button, setMenu: &*menu] };
-            }
+            // Set menu delegate to self (for menuWillOpen: interception)
+            menu.setDelegate(Some(ProtocolObject::from_ref(
+                &*(self as &DaemonDelegate),
+            )));
+
+            // Attach menu to status item — opens on ANY click (left or right)
+            status_item.setMenu(Some(&menu));
 
             // Store raw pointers for cross-thread access
             ITEM_PTR.store(
@@ -320,22 +318,44 @@ define_class!(
         }
     }
 
-    // -- Menu action methods --
+    // NSMenuDelegate: intercept left-click to toggle instead of showing menu
+    unsafe impl NSMenuDelegate for DaemonDelegate {
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, menu: &NSMenu) {
+            let mtm = self.mtm();
+            let app = NSApplication::sharedApplication(mtm);
 
-    impl DaemonDelegate {
-        #[unsafe(method(toggleVisibility:))]
-        fn toggle_visibility(&self, _sender: *mut AnyObject) {
-            let state = CURRENT_STATE.load(Ordering::SeqCst);
-            if state == 1 {
-                PENDING_CMD.store(2, Ordering::SeqCst);
-            } else {
-                PENDING_CMD.store(1, Ordering::SeqCst);
+            // Check if this is a left-click (buttonNumber == 0)
+            let is_left_click: bool = unsafe {
+                let event: *const AnyObject = msg_send![&*app, currentEvent];
+                if event.is_null() {
+                    true
+                } else {
+                    let btn: isize = msg_send![event, buttonNumber];
+                    btn == 0
+                }
+            };
+
+            if is_left_click {
+                // Cancel the menu and toggle visibility instead
+                menu.cancelTrackingWithoutAnimation();
+
+                let state = CURRENT_STATE.load(Ordering::SeqCst);
+                if state == 1 {
+                    PENDING_CMD.store(2, Ordering::SeqCst);
+                } else {
+                    PENDING_CMD.store(1, Ordering::SeqCst);
+                }
+                unsafe {
+                    process_on_main(std::ptr::null_mut());
+                }
             }
-            unsafe {
-                process_on_main(std::ptr::null_mut());
-            }
+            // Right-click: menu opens normally (do nothing here)
         }
+    }
 
+    // Menu action methods
+    impl DaemonDelegate {
         #[unsafe(method(toggleStartAtLogin:))]
         fn toggle_start_at_login(&self, _sender: *mut AnyObject) {
             if crate::is_installed() {
