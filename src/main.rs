@@ -1,390 +1,100 @@
-mod client;
-mod daemon;
-mod menubar;
-
-use std::path::PathBuf;
-
-use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-
-#[derive(Parser)]
-#[command(name = "nanobar", about = "macOS menu bar manager")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+use std::cell::{Cell, OnceCell};
+use objc2::{define_class, msg_send, sel, rc::Retained, runtime::{AnyObject, ProtocolObject},
+    DefinedClass, MainThreadOnly};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
+use objc2_foundation::{ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
+extern "C" { fn kill(pid: i32, sig: i32) -> i32; fn fork() -> i32; fn setsid() -> i32; }
+#[derive(Debug)] struct DaemonIvars {
+    status_item: OnceCell<Retained<NSStatusItem>>, pusher_item: OnceCell<Retained<NSStatusItem>>,
+    hidden: Cell<bool>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// List all menu bar items
-    List,
-    /// Start the nanobar daemon (adds a '|' divider to menu bar)
-    Start,
-    /// Hide menu bar items (optionally specify apps to set divider position)
-    Hide {
-        /// App names to hide (moves divider right of the rightmost specified app)
-        apps: Vec<String>,
-    },
-    /// Show all hidden items
-    Show,
-    /// Stop the daemon and remove the divider
-    Stop,
-    /// Show current status
-    Status,
-    /// Install launch agent for auto-start at login
-    Install,
-    /// Uninstall launch agent
-    Uninstall,
-    /// Internal: run as daemon process
-    #[command(hide = true)]
-    Daemon,
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::List => {
-            cmd_list();
-            Ok(())
-        }
-        Commands::Start => cmd_start(),
-        Commands::Hide { apps } => cmd_hide(&apps),
-        Commands::Show => cmd_show(),
-        Commands::Stop => cmd_stop(),
-        Commands::Status => cmd_status(),
-        Commands::Install => cmd_install(),
-        Commands::Uninstall => cmd_uninstall(),
-        Commands::Daemon => {
-            daemon::run_daemon();
-            Ok(())
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = DaemonIvars]
+    #[derive(Debug)]
+    struct Delegate;
+    unsafe impl NSObjectProtocol for Delegate {}
+    unsafe impl NSApplicationDelegate for Delegate {
+        #[unsafe(method(applicationDidFinishLaunching:))]
+        fn did_finish_launching(&self, _: &NSNotification) {
+            let mtm = self.mtm();
+            let bar = NSStatusBar::systemStatusBar();
+            let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+            item.setAutosaveName(Some(ns_string!("Item-0")));
+            if let Some(b) = item.button(mtm) { b.setTitle(ns_string!("\u{203a}")); }
+            let pusher = bar.statusItemWithLength(NSVariableStatusItemLength);
+            pusher.setAutosaveName(Some(ns_string!("Pusher-0")));
+            if let Some(b) = pusher.button(mtm) { b.setTitle(ns_string!("\u{200B}")); }
+            let menu = NSMenu::new(mtm);
+            let quit = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm), ns_string!("Quit"), Some(sel!(quit:)), ns_string!("")) };
+            unsafe { quit.setTarget(Some(&*(self as *const Delegate as *const AnyObject))); }
+            menu.addItem(&quit);
+            menu.setDelegate(Some(ProtocolObject::from_ref(self as &Delegate)));
+            item.setMenu(Some(&menu));
+            self.ivars().status_item.set(item).unwrap();
+            self.ivars().pusher_item.set(pusher).unwrap();
+            let _ = std::fs::write(std::env::temp_dir().join("nanobar.pid"),
+                std::process::id().to_string());
         }
     }
-}
-
-fn cmd_list() {
-    let items = menubar::list_menubar_items();
-    let divider = items.iter().find(|i| i.owner_name == "nanobar");
-    let expanded = divider.map(|d| d.width > 100.0).unwrap_or(false);
-
-    println!(
-        "{:>3}  {:<20} {:>6}  {:>7}  {:>6}  {:>4}",
-        "#", "App", "PID", "Window", "X", "W"
-    );
-    for (i, item) in items.iter().enumerate() {
-        let marker = if item.owner_name == "nanobar" {
-            " <-- divider"
-        } else if item.x < 0.0 {
-            // Pushed off left edge of screen
-            " [hidden]"
-        } else if let Some(d) = divider {
-            if !expanded && item.x < d.x {
-                " [will hide]"
-            } else {
-                ""
-            }
-        } else {
-            ""
-        };
-        println!(
-            "{:>3}  {:<20} {:>6}  {:>7}  {:>6.0}  {:>4.0}{}",
-            i + 1,
-            item.owner_name,
-            item.owner_pid,
-            item.window_id,
-            item.x,
-            item.width,
-            marker,
-        );
-    }
-}
-
-fn cmd_start() -> Result<()> {
-    if client::is_daemon_running() {
-        println!("daemon already running");
-        return Ok(());
-    }
-
-    let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    // Wait for daemon to be ready
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if client::is_daemon_running() {
-            println!("daemon started");
-            return Ok(());
-        }
-    }
-
-    bail!("daemon failed to start within 5 seconds");
-}
-
-fn cmd_hide(apps: &[String]) -> Result<()> {
-    if !apps.is_empty() {
-        // Move divider to hide specified apps, then expand
-        move_divider_for_apps(apps)?;
-    }
-
-    // Ensure daemon is running
-    if !client::is_daemon_running() {
-        cmd_start()?;
-    }
-
-    let resp = client::send_command("hide")?;
-    if resp == "ok" {
-        if apps.is_empty() {
-            println!("items left of divider hidden");
-        }
-    }
-    Ok(())
-}
-
-/// Move divider to be just right of the rightmost specified app
-fn move_divider_for_apps(apps: &[String]) -> Result<()> {
-    let items = menubar::list_menubar_items();
-
-    // Resolve numeric args (sequence numbers from `list`) to app names
-    let resolved: Vec<String> = apps
-        .iter()
-        .map(|arg| {
-            if let Ok(n) = arg.parse::<usize>() {
-                if n >= 1 && n <= items.len() {
-                    return items[n - 1].owner_name.clone();
-                }
-            }
-            arg.clone()
-        })
-        .collect();
-
-    // Find the rightmost target app (highest X = furthest right = should be just left of divider)
-    let mut best_position: Option<f64> = None;
-    let mut matched_names = Vec::new();
-
-    for name in &resolved {
-        let name_lower = name.to_lowercase();
-        let matched: Vec<_> = items
-            .iter()
-            .filter(|item| {
-                item.owner_name.to_lowercase().contains(&name_lower)
-                    && item.owner_name != "nanobar"
-            })
-            .collect();
-
-        if matched.is_empty() {
-            eprintln!("  not found in menu bar: {}", name);
-            continue;
-        }
-
-        for item in &matched {
-            // Get bundle ID and preferred position
-            if let Some(bundle_id) = menubar::get_bundle_id(item.owner_pid) {
-                if let Some(pos) = menubar::get_preferred_position(&bundle_id) {
-                    matched_names.push(item.owner_name.clone());
-                    // We want the divider to have a LOWER position value than the target
-                    // (lower value = further right in the menu bar)
-                    // Take the minimum position among all targets
-                    best_position = Some(match best_position {
-                        Some(bp) => bp.min(pos),
-                        None => pos,
-                    });
-                } else {
-                    eprintln!(
-                        "  no saved position for: {} ({})",
-                        item.owner_name, bundle_id
-                    );
-                }
-            } else {
-                eprintln!("  cannot find bundle ID for: {}", item.owner_name);
+    unsafe impl NSMenuDelegate for Delegate {
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, menu: &NSMenu) {
+            let mtm = self.mtm();
+            let is_left: bool = unsafe {
+                let e: *const AnyObject =
+                    msg_send![&*NSApplication::sharedApplication(mtm), currentEvent];
+                e.is_null() || { let b: isize = msg_send![e, buttonNumber]; b == 0 }
+            };
+            if is_left {
+                menu.cancelTrackingWithoutAnimation();
+                let hidden = self.ivars().hidden.get();
+                let pusher = self.ivars().pusher_item.get().unwrap();
+                let button = self.ivars().status_item.get().unwrap().button(mtm).unwrap();
+                pusher.setLength(if hidden { NSVariableStatusItemLength } else { 10000.0 });
+                button.setTitle(if hidden { ns_string!("\u{203a}") } else { ns_string!("\u{2039}") });
+                self.ivars().hidden.set(!hidden);
             }
         }
     }
-
-    let target_pos = match best_position {
-        Some(p) => p,
-        None => bail!("could not determine divider position for specified apps"),
-    };
-
-    // Find the rightmost matched item's X to estimate new divider placement
-    let rightmost_target_x = matched_names.iter().filter_map(|name| {
-        items.iter().find(|i| &i.owner_name == name).map(|i| i.x + i.width)
-    }).max_by(|a, b| a.partial_cmp(b).unwrap());
-
-    if let Some(cut_x) = rightmost_target_x {
-        let also_hidden: Vec<_> = items
-            .iter()
-            .filter(|i| i.x < cut_x && i.owner_name != "nanobar" && !matched_names.contains(&i.owner_name))
-            .collect();
-
-        if also_hidden.is_empty() {
-            println!("hiding: {}", matched_names.join(", "));
-        } else {
-            let also_names: Vec<_> = also_hidden.iter().map(|i| i.owner_name.as_str()).collect();
-            println!("hiding: {} (also: {})", matched_names.join(", "), also_names.join(", "));
-        }
-    } else {
-        println!("hiding: {}", matched_names.join(", "));
-    }
-
-    // Set nanobar position to slightly less than the target (further right)
-    let new_pos = (target_pos - 20.0).max(1.0);
-
-    // Stop daemon if running
-    let was_running = client::is_daemon_running();
-    if was_running {
-        let _ = client::send_command("stop");
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-
-    // Write new position
-    let status = std::process::Command::new("defaults")
-        .args([
-            "write",
-            "nanobar",
-            "NSStatusItem Preferred Position Item-0",
-            "-float",
-            &format!("{:.1}", new_pos),
-        ])
-        .status()?;
-
-    if !status.success() {
-        bail!("failed to write position to defaults");
-    }
-
-    // Restart daemon
-    cmd_start()?;
-
-    Ok(())
-}
-
-fn cmd_show() -> Result<()> {
-    let resp = client::send_command("show")?;
-    if resp == "ok" {
-        println!("all items visible");
-    }
-    Ok(())
-}
-
-fn cmd_stop() -> Result<()> {
-    if !client::is_daemon_running() {
-        println!("daemon not running");
-        return Ok(());
-    }
-    let resp = client::send_command("stop")?;
-    if resp == "ok" {
-        println!("daemon stopped");
-    }
-    Ok(())
-}
-
-// -- LaunchAgent helpers (used by main.rs and daemon.rs) --
-
-pub fn launchagent_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join("Library/LaunchAgents/nanobar.plist")
-}
-
-pub fn is_installed() -> bool {
-    launchagent_path().exists()
-}
-
-fn cmd_install() -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let exe_path = exe.to_string_lossy();
-    let plist_path = launchagent_path();
-
-    // Ensure LaunchAgents directory exists
-    if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>nanobar</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{}</string>
-        <string>daemon</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-"#,
-        exe_path
-    );
-
-    std::fs::write(&plist_path, plist)?;
-    println!("installed: {}", plist_path.display());
-    println!("nanobar will start automatically at login");
-    Ok(())
-}
-
-fn cmd_uninstall() -> Result<()> {
-    let plist_path = launchagent_path();
-    if !plist_path.exists() {
-        println!("not installed");
-        return Ok(());
-    }
-
-    // Try to unload first (ignore errors if not loaded)
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", &plist_path.to_string_lossy()])
-        .status();
-
-    std::fs::remove_file(&plist_path)?;
-    println!("uninstalled");
-    Ok(())
-}
-
-fn cmd_status() -> Result<()> {
-    if !client::is_daemon_running() {
-        println!("daemon: not running");
-        println!("use 'nanobar start' to begin");
-        return Ok(());
-    }
-
-    let state = client::send_command("state")?;
-    println!("daemon: running");
-    println!("state:  {}", state);
-
-    // Show which items would be hidden
-    let items = menubar::list_menubar_items();
-    let divider = items.iter().find(|i| i.owner_name == "nanobar");
-    if let Some(div) = divider {
-        let hidden: Vec<_> = items
-            .iter()
-            .filter(|i| i.x < div.x && i.owner_name != "nanobar")
-            .collect();
-        let visible: Vec<_> = items
-            .iter()
-            .filter(|i| i.x > div.x && i.owner_name != "nanobar")
-            .collect();
-
-        if !hidden.is_empty() {
-            println!(
-                "\nwill hide ({}):",
-                hidden.len()
-            );
-            for item in &hidden {
-                println!("  - {}", item.owner_name);
-            }
-        }
-        println!("\nvisible ({}):", visible.len());
-        for item in &visible {
-            println!("  - {}", item.owner_name);
+    impl Delegate {
+        #[unsafe(method(quit:))]
+        fn quit(&self, _: *mut AnyObject) {
+            let _ = std::fs::remove_file(std::env::temp_dir().join("nanobar.pid"));
+            std::process::exit(0);
         }
     }
+);
+impl Delegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(DaemonIvars {
+            status_item: OnceCell::new(), pusher_item: OnceCell::new(), hidden: Cell::new(false),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+}
 
-    Ok(())
+fn main() {
+    if std::env::args().count() > 1 {
+        println!("nanobar {} - minimal macOS menu bar manager\nUsage: nanobar",
+            env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if std::fs::read_to_string(std::env::temp_dir().join("nanobar.pid")).ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .is_some_and(|pid| unsafe { kill(pid, 0) } == 0)
+    { eprintln!("nanobar: already running"); std::process::exit(1); }
+    let pid = unsafe { fork() };
+    if pid != 0 { std::process::exit(if pid > 0 { 0 } else { 1 }); }
+    unsafe { setsid(); }
+    let mtm = MainThreadMarker::new().unwrap();
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let delegate = Delegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    app.run();
 }
