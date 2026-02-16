@@ -30,8 +30,7 @@ define_class!(
             if let Some(b) = pusher.button(mtm) { b.setTitle(ns_string!("\u{200B}")); }
             let menu = NSMenu::new(mtm);
             let quit = unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm), ns_string!("Quit"), Some(sel!(quit:)), ns_string!("")) };
-            unsafe { quit.setTarget(Some(&*(self as *const Delegate as *const AnyObject))); }
+                NSMenuItem::alloc(mtm), ns_string!("Quit"), Some(sel!(terminate:)), ns_string!("")) };
             menu.addItem(&quit);
             menu.setDelegate(Some(ProtocolObject::from_ref(self as &Delegate)));
             item.setMenu(Some(&menu));
@@ -39,6 +38,10 @@ define_class!(
             self.ivars().pusher_item.set(pusher).unwrap();
             let _ = std::fs::write(std::env::temp_dir().join("nanobar.pid"),
                 std::process::id().to_string());
+        }
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _: &NSNotification) {
+            let _ = std::fs::remove_file(std::env::temp_dir().join("nanobar.pid"));
         }
     }
     unsafe impl NSMenuDelegate for Delegate {
@@ -59,13 +62,6 @@ define_class!(
                 button.setTitle(if hidden { ns_string!("\u{203a}") } else { ns_string!("\u{2039}") });
                 self.ivars().hidden.set(!hidden);
             }
-        }
-    }
-    impl Delegate {
-        #[unsafe(method(quit:))]
-        fn quit(&self, _: *mut AnyObject) {
-            let _ = std::fs::remove_file(std::env::temp_dir().join("nanobar.pid"));
-            std::process::exit(0);
         }
     }
 );

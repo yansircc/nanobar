@@ -1,6 +1,6 @@
 # Nanobar
 
-100 lines of Rust. A minimal macOS menu bar manager.
+~90 lines of Rust. A minimal macOS menu bar manager.
 
 No Bartender, no Ice, no accessibility permissions, no Screen Recording permissions.
 
@@ -9,6 +9,22 @@ No Bartender, no Ice, no accessibility permissions, no Screen Recording permissi
 Creates an invisible `NSStatusItem` pusher. On click, it expands to 10000pt, pushing icons to its left off-screen. Same native technique as Bartender/Ice — no private APIs, no SIP.
 
 ## Install
+
+### Download (recommended)
+
+From [GitHub Releases](https://github.com/yansircc/nanobar/releases/latest):
+
+```bash
+# Apple Silicon (M1/M2/M3/M4)
+curl -sL https://github.com/yansircc/nanobar/releases/latest/download/nanobar-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv nanobar /usr/local/bin/
+
+# Intel Mac
+curl -sL https://github.com/yansircc/nanobar/releases/latest/download/nanobar-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv nanobar /usr/local/bin/
+```
+
+### From source
 
 ```bash
 cargo install nanobar
